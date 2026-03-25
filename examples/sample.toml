@@ -1,0 +1,53 @@
+# Sample USB device profile
+# Copy to ~/.config/usb-helper/sample.toml
+# Then use: usb-helper --profile sample
+
+description = "Sample USB devices"
+
+# ── Bulk mode devices ──
+
+[[rules]]
+vid = "1234"
+pid = "abcd"
+label = "Device Bulk (1234:abcd)"
+[rules.metadata]
+mode = "bulk"
+
+[[rules]]
+vid = "1234"
+pid = "abce"
+label = "Device Bulk (1234:abce)"
+[rules.metadata]
+mode = "bulk"
+
+# ── Storage mode devices ──
+
+[[rules]]
+vid = "1234"
+pid = "0002"
+label = "Device Storage (1234:0002)"
+[rules.metadata]
+mode = "storage"
+
+[[rules]]
+vid = "1234"
+pid = "0003"
+label = "Device Storage (1234:0003)"
+[rules.metadata]
+mode = "storage"
+
+# ── Alternative VID (5678) ──
+
+[[rules]]
+vid = "5678"
+pid = "abcd"
+label = "Device Bulk (5678:abcd)"
+[rules.metadata]
+mode = "bulk"
+
+[[rules]]
+vid = "5678"
+pid = "0002"
+label = "Device Storage (5678:0002)"
+[rules.metadata]
+mode = "storage"
