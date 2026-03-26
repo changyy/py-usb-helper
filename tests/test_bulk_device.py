@@ -22,7 +22,13 @@ import usb.core
 import usb.util
 
 from usb_helper.bulk_device import BulkDevice
-from usb_helper.types import DeviceIdentity, USBDeviceNotFoundError, USBPermissionError, USBError
+from usb_helper.types import (
+    DeviceIdentity,
+    USBDeviceNotFoundError,
+    USBPermissionError,
+    USBTransferError,
+    USBError,
+)
 
 
 @pytest.fixture
@@ -106,6 +112,17 @@ class TestBulkDeviceOpen:
                    side_effect=usb.core.USBError("Access denied")):
             dev = BulkDevice(identity)
             with pytest.raises(USBPermissionError, match="Cannot claim"):
+                dev.open()
+
+    def test_open_busy_error(self, identity):
+        mock_dev = MagicMock()
+        mock_dev.is_kernel_driver_active.return_value = False
+
+        with patch("usb_helper.bulk_device.usb.core.find", return_value=mock_dev), \
+             patch("usb_helper.bulk_device.usb.util.claim_interface",
+                   side_effect=usb.core.USBError("Resource busy")):
+            dev = BulkDevice(identity)
+            with pytest.raises(USBTransferError, match="busy"):
                 dev.open()
 
 

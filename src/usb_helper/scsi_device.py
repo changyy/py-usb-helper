@@ -51,6 +51,8 @@ class SCSIDevice(USBDevice):
         frame_size: Max data payload per bulk transfer (default 16384)
         interface_number: USB interface to claim (default 0)
         max_retries: Max retries on phase error (default 2)
+        darwin_auto_unmount: On macOS, run ``diskutil unmountDisk`` before
+            opening ``/dev/rdiskN`` for ioctl (best-effort, default False)
     """
 
     def __init__(
@@ -59,6 +61,7 @@ class SCSIDevice(USBDevice):
         frame_size: int = 16384,
         interface_number: int = 0,
         max_retries: int = 2,
+        darwin_auto_unmount: bool = False,
     ):
         super().__init__(identity)
         self._bulk = BulkDevice(
@@ -71,6 +74,7 @@ class SCSIDevice(USBDevice):
         self._tag: int = 0
         # macOS Darwin SCSI ioctl transport (None when not on macOS or no BSD node)
         self._darwin_transport: Optional[object] = None
+        self._darwin_auto_unmount = bool(darwin_auto_unmount)
 
     @property
     def frame_size(self) -> int:
@@ -95,7 +99,11 @@ class SCSIDevice(USBDevice):
         # claimed the USB interface (typical for UDISK-mode devices).
         if _IS_DARWIN:
             try:
-                from ._darwin_scsi import find_bsd_node, DarwinSCSITransport
+                from ._darwin_scsi import (
+                    find_bsd_node,
+                    DarwinSCSITransport,
+                    unmount_disk_for_bsd_node,
+                )
 
                 logger.info(
                     "Darwin: looking up BSD node for %s (VID=%04x PID=%04x serial=%r)",
@@ -110,6 +118,14 @@ class SCSIDevice(USBDevice):
                     serial=self._identity.serial,
                 )
                 if bsd_path:
+                    if self._darwin_auto_unmount:
+                        ok = unmount_disk_for_bsd_node(bsd_path)
+                        if not ok:
+                            logger.info(
+                                "Darwin auto-unmount did not succeed for %s; continuing",
+                                bsd_path,
+                            )
+
                     transport = DarwinSCSITransport()
                     transport.open(bsd_path)
                     self._darwin_transport = transport

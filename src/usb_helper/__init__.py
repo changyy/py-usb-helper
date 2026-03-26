@@ -20,7 +20,7 @@ from .bulk_device import BulkDevice
 from .scsi_device import SCSIDevice
 from .config import Profile, load_profile, load_profile_by_name, list_profiles
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 def get_meta() -> dict:
     """Return runtime environment metadata (version, platform, pyusb, libusb)."""

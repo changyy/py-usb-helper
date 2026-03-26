@@ -6,6 +6,7 @@ All tests are mock-based and can run on any platform.
 
 from __future__ import annotations
 
+import errno
 import struct
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -20,9 +21,9 @@ from usb_helper.types import DeviceIdentity, TransferResult
 class TestDarwinSCSITransport:
     """Test DarwinSCSITransport with mocked os/fcntl calls."""
 
-    def _make_transport(self):
+    def _make_transport(self, **kwargs):
         from usb_helper._darwin_scsi import DarwinSCSITransport
-        return DarwinSCSITransport()
+        return DarwinSCSITransport(**kwargs)
 
     @patch("usb_helper._darwin_scsi.os.open", return_value=42)
     def test_open_success(self, mock_os_open):
@@ -101,6 +102,49 @@ class TestDarwinSCSITransport:
         assert not result.ok
         assert result.error_code == 15
         assert "ioctl failed" in result.error_message
+
+    @patch("usb_helper._darwin_scsi.time.sleep")
+    @patch("usb_helper._darwin_scsi.fcntl.ioctl")
+    @patch("usb_helper._darwin_scsi.os.open", return_value=42)
+    def test_send_command_busy_retries_then_success(self, mock_os_open, mock_ioctl, mock_sleep):
+        transport = self._make_transport()
+        transport.open("/dev/rdisk4")
+
+        mock_ioctl.side_effect = [
+            OSError(errno.EBUSY, "Device busy"),
+            OSError(errno.EBUSY, "Device busy"),
+            None,
+        ]
+
+        result = transport.send_command(cdb=b"\xcb\x00", data_in_length=2)
+
+        assert result.ok
+        assert mock_ioctl.call_count == 3
+        assert mock_sleep.call_count == 2
+
+    @patch("usb_helper._darwin_scsi.fcntl.ioctl", side_effect=OSError(errno.EPERM, "Operation not permitted"))
+    @patch("usb_helper._darwin_scsi.os.open", return_value=42)
+    def test_send_command_permission_error_code(self, mock_os_open, mock_ioctl):
+        transport = self._make_transport()
+        transport.open("/dev/rdisk4")
+
+        result = transport.send_command(cdb=b"\xcb\x00", data_in_length=2)
+
+        assert not result.ok
+        assert result.error_code == 16
+        assert "permission denied" in result.error_message
+
+    @patch("usb_helper._darwin_scsi.fcntl.ioctl", side_effect=OSError(errno.EBUSY, "Device busy"))
+    @patch("usb_helper._darwin_scsi.os.open", return_value=42)
+    def test_send_command_busy_error_code(self, mock_os_open, mock_ioctl):
+        transport = self._make_transport(busy_retries=0)
+        transport.open("/dev/rdisk4")
+
+        result = transport.send_command(cdb=b"\xcb\x00", data_in_length=2)
+
+        assert not result.ok
+        assert result.error_code == 17
+        assert "resource busy" in result.error_message
 
     def test_both_data_out_and_data_in_raises(self):
         from usb_helper._darwin_scsi import DarwinSCSITransport
@@ -315,6 +359,32 @@ class TestFindBsdNode:
             assert result == "/dev/rdisk5"
 
 
+# ── unmount helper tests ───────────────────────────────────────
+
+
+class TestDarwinUnmountHelper:
+    @patch("usb_helper._darwin_scsi.subprocess.run")
+    def test_unmount_disk_for_rdisk_path(self, mock_run):
+        from usb_helper._darwin_scsi import unmount_disk_for_bsd_node
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
+        ok = unmount_disk_for_bsd_node("/dev/rdisk4")
+
+        assert ok
+        mock_run.assert_called_once()
+        args = mock_run.call_args[0][0]
+        assert args == ["diskutil", "unmountDisk", "/dev/disk4"]
+
+    @patch("usb_helper._darwin_scsi.subprocess.run")
+    def test_unmount_disk_failure_returns_false(self, mock_run):
+        from usb_helper._darwin_scsi import unmount_disk_for_bsd_node
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="busy")
+        ok = unmount_disk_for_bsd_node("rdisk7")
+
+        assert not ok
+
+
 # ── SCSIDevice Darwin integration tests ────────────────────────
 
 
@@ -322,9 +392,10 @@ class TestSCSIDeviceDarwinIntegration:
     """Test that SCSIDevice routes to Darwin transport on macOS."""
 
     @patch("usb_helper.scsi_device._IS_DARWIN", True)
+    @patch("usb_helper._darwin_scsi.unmount_disk_for_bsd_node")
     @patch("usb_helper._darwin_scsi.find_bsd_node", return_value="/dev/rdisk4")
     @patch("usb_helper._darwin_scsi.DarwinSCSITransport")
-    def test_open_uses_darwin_on_macos(self, MockTransport, mock_find):
+    def test_open_uses_darwin_on_macos(self, MockTransport, mock_find, mock_unmount):
         transport = MagicMock()
         MockTransport.return_value = transport
 
@@ -334,6 +405,27 @@ class TestSCSIDeviceDarwinIntegration:
 
         assert scsi.is_open
         assert scsi.using_darwin_ioctl
+        transport.open.assert_called_once_with("/dev/rdisk4")
+        mock_unmount.assert_not_called()
+
+    @patch("usb_helper.scsi_device._IS_DARWIN", True)
+    @patch("usb_helper._darwin_scsi.unmount_disk_for_bsd_node", return_value=True)
+    @patch("usb_helper._darwin_scsi.find_bsd_node", return_value="/dev/rdisk4")
+    @patch("usb_helper._darwin_scsi.DarwinSCSITransport")
+    def test_open_auto_unmount_before_darwin_ioctl(
+        self,
+        MockTransport,
+        mock_find,
+        mock_unmount,
+    ):
+        transport = MagicMock()
+        MockTransport.return_value = transport
+
+        identity = DeviceIdentity(vid=0x1DE1, pid=0x1205, bus=1, address=3)
+        scsi = SCSIDevice(identity, darwin_auto_unmount=True)
+        scsi.open()
+
+        mock_unmount.assert_called_once_with("/dev/rdisk4")
         transport.open.assert_called_once_with("/dev/rdisk4")
 
     @patch("usb_helper.scsi_device._IS_DARWIN", True)

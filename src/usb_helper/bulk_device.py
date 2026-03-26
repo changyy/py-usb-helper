@@ -7,6 +7,7 @@ endpoint discovery and frame-based chunked writes.
 
 from __future__ import annotations
 
+import errno
 import logging
 from typing import Optional
 
@@ -25,6 +26,22 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_permission_usb_error(exc: usb.core.USBError) -> bool:
+    msg = str(exc).lower()
+    errno_value = getattr(exc, "errno", None)
+    if errno_value in (errno.EACCES, errno.EPERM):
+        return True
+    return ("access denied" in msg) or ("permission denied" in msg) or ("not permitted" in msg)
+
+
+def _is_busy_usb_error(exc: usb.core.USBError) -> bool:
+    msg = str(exc).lower()
+    errno_value = getattr(exc, "errno", None)
+    if errno_value in (errno.EBUSY, errno.EAGAIN):
+        return True
+    return ("resource busy" in msg) or ("device busy" in msg) or ("in use" in msg)
 
 
 class BulkDevice(USBDevice):
@@ -99,7 +116,15 @@ class BulkDevice(USBDevice):
         try:
             usb.util.claim_interface(dev, self._interface_number)
         except usb.core.USBError as e:
-            raise USBPermissionError(
+            if _is_permission_usb_error(e):
+                raise USBPermissionError(
+                    f"Cannot claim interface {self._interface_number}: {e}"
+                ) from e
+            if _is_busy_usb_error(e):
+                raise USBTransferError(
+                    f"Interface {self._interface_number} is busy (likely claimed by OS/other process): {e}"
+                ) from e
+            raise USBError(
                 f"Cannot claim interface {self._interface_number}: {e}"
             ) from e
 

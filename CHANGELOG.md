@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-03-26
+
+### Added
+
+- **macOS auto-unmount option for firmware flashing**: `SCSIDevice(..., darwin_auto_unmount=True)` now performs a best-effort `diskutil unmountDisk` before opening `/dev/rdiskN`, reducing OS contention during flashing workflows.
+
+### Improved
+
+- **Darwin busy handling**: added exponential backoff retries for `open()` and `ioctl()` on resource-busy errors in BSD SCSI transport.
+- **Error classification**: Darwin ioctl failures now distinguish permission denied vs resource busy vs generic ioctl failure using dedicated `TransferResult.error_code` values.
+- **Bulk claim diagnostics**: `BulkDevice.open()` now classifies claim-interface errors more clearly (permission vs busy vs generic), improving upstream recovery logic.
+
+### Tests
+
+- Added coverage for:
+  - Darwin busy-retry success path and error-code mapping.
+  - Darwin disk unmount helper behavior.
+  - `SCSIDevice` auto-unmount integration path.
+  - `BulkDevice` busy claim-interface path.
+
 ## [1.0.1] - 2026-03-26
 
 ### Fixed

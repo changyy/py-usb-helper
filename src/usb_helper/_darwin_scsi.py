@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import fcntl
 import logging
 import os
 import plistlib
 import subprocess
 import sys
+import time
 from typing import Optional
 
 from .types import DeviceIdentity, TransferResult
@@ -49,6 +51,11 @@ DKIOCSCSICMD = 0xC02864FD
 _DIR_NONE = 0
 _DIR_IN = 1    # device → host  (read)
 _DIR_OUT = 2   # host → device  (write)
+
+# TransferResult error codes (Darwin ioctl path)
+ERR_IOCTL_FAILED = 15
+ERR_PERMISSION_DENIED = 16
+ERR_RESOURCE_BUSY = 17
 
 
 # ── dk_scsi_cmd_t ──────────────────────────────────────────────
@@ -156,6 +163,68 @@ def _log_stderr(fmt: str, *args: object) -> None:
     logger.info(msg)
     import sys as _sys
     print(msg, file=_sys.stderr, flush=True)
+
+
+def _to_disk_node_path(bsd_path: str) -> str:
+    """
+    Normalize a BSD path/name to ``/dev/diskN`` form for diskutil commands.
+
+    Examples:
+      /dev/rdisk4 -> /dev/disk4
+      /dev/disk5  -> /dev/disk5
+      rdisk6      -> /dev/disk6
+      disk7       -> /dev/disk7
+    """
+    value = bsd_path.strip()
+    if value.startswith("/dev/rdisk"):
+        return value.replace("/dev/rdisk", "/dev/disk", 1)
+    if value.startswith("/dev/disk"):
+        return value
+    if value.startswith("rdisk"):
+        return f"/dev/disk{value[len('rdisk'):]}"
+    if value.startswith("disk"):
+        return f"/dev/{value}"
+    return value
+
+
+def unmount_disk_for_bsd_node(
+    bsd_path: str,
+    *,
+    force: bool = False,
+    timeout_sec: int = 10,
+) -> bool:
+    """
+    Try to unmount all mounted volumes for a BSD disk before raw SCSI access.
+
+    Returns:
+        True when unmount succeeds, False otherwise.
+    """
+    disk_path = _to_disk_node_path(bsd_path)
+    cmd = ["diskutil", "unmountDisk"]
+    if force:
+        cmd.append("force")
+    cmd.append(disk_path)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except Exception as e:
+        logger.info("diskutil unmount failed for %s: %s", disk_path, e)
+        return False
+
+    if result.returncode == 0:
+        logger.info("diskutil unmount succeeded for %s", disk_path)
+        return True
+
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    detail = stderr or stdout or f"returncode={result.returncode}"
+    logger.info("diskutil unmount failed for %s: %s", disk_path, detail)
+    return False
 
 
 # ── Strategy 1: diskutil ──────────────────────────────────────
@@ -387,6 +456,20 @@ def _ioreg_subtree_has_serial(
     return False
 
 
+def _is_permission_error(exc: OSError) -> bool:
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return True
+    msg = str(exc).lower()
+    return ("permission denied" in msg) or ("operation not permitted" in msg)
+
+
+def _is_resource_busy_error(exc: OSError) -> bool:
+    if exc.errno in (errno.EBUSY, errno.EAGAIN):
+        return True
+    msg = str(exc).lower()
+    return ("resource busy" in msg) or ("device busy" in msg) or ("in use" in msg)
+
+
 # ── Strategy 3: ioreg plist (forward lookup) ──────────────────
 
 def _find_bsd_via_ioreg_plist(vid: int, pid: int, *, serial: str = "") -> Optional[str]:
@@ -490,9 +573,16 @@ class DarwinSCSITransport:
         transport.close()
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        busy_retries: int = 3,
+        busy_backoff_ms: int = 80,
+    ) -> None:
         self._fd: int = -1
         self._path: str = ""
+        self._busy_retries = max(0, busy_retries)
+        self._busy_backoff_ms = max(1, busy_backoff_ms)
 
     @property
     def is_open(self) -> bool:
@@ -502,10 +592,33 @@ class DarwinSCSITransport:
         """Open a raw BSD device for SCSI ioctl."""
         if self._fd >= 0:
             return
-        fd = os.open(bsd_path, os.O_RDWR)
-        self._fd = fd
-        self._path = bsd_path
-        logger.info("Darwin SCSI transport opened: %s (fd=%d)", bsd_path, fd)
+        last_exc: Optional[OSError] = None
+        for attempt in range(self._busy_retries + 1):
+            try:
+                fd = os.open(bsd_path, os.O_RDWR)
+                self._fd = fd
+                self._path = bsd_path
+                logger.info("Darwin SCSI transport opened: %s (fd=%d)", bsd_path, fd)
+                return
+            except OSError as e:
+                last_exc = e
+                if _is_permission_error(e):
+                    raise
+                if _is_resource_busy_error(e) and attempt < self._busy_retries:
+                    delay_s = (self._busy_backoff_ms * (2 ** attempt)) / 1000.0
+                    logger.info(
+                        "open(%s) busy, retrying in %.3fs (attempt %d/%d)",
+                        bsd_path,
+                        delay_s,
+                        attempt + 1,
+                        self._busy_retries,
+                    )
+                    time.sleep(delay_s)
+                    continue
+                raise
+
+        if last_exc is not None:
+            raise last_exc
 
     def close(self) -> None:
         """Close the BSD device."""
@@ -561,7 +674,9 @@ class DarwinSCSITransport:
                 buf = ctypes.create_string_buffer(data_in_length)
                 cmd.dataBuffer = ctypes.cast(buf, ctypes.c_void_p).value
 
-                fcntl.ioctl(self._fd, DKIOCSCSICMD, cmd)
+                err = self._ioctl_with_retry(cmd)
+                if err is not None:
+                    return self._ioctl_error_result(err)
 
                 if cmd.scsiStatus != 0:
                     return TransferResult(
@@ -583,7 +698,9 @@ class DarwinSCSITransport:
                 buf = ctypes.create_string_buffer(data_out, len(data_out))
                 cmd.dataBuffer = ctypes.cast(buf, ctypes.c_void_p).value
 
-                fcntl.ioctl(self._fd, DKIOCSCSICMD, cmd)
+                err = self._ioctl_with_retry(cmd)
+                if err is not None:
+                    return self._ioctl_error_result(err)
 
                 if cmd.scsiStatus != 0:
                     return TransferResult(
@@ -603,7 +720,9 @@ class DarwinSCSITransport:
                 cmd.dataTransferLength = 0
                 cmd.dataBuffer = None
 
-                fcntl.ioctl(self._fd, DKIOCSCSICMD, cmd)
+                err = self._ioctl_with_retry(cmd)
+                if err is not None:
+                    return self._ioctl_error_result(err)
 
                 if cmd.scsiStatus != 0:
                     return TransferResult(
@@ -615,8 +734,43 @@ class DarwinSCSITransport:
                 return TransferResult(ok=True, bytes_transferred=0)
 
         except OSError as e:
-            return TransferResult(
-                ok=False,
-                error_code=15,
-                error_message=f"ioctl failed on {self._path}: {e}",
-            )
+            return self._ioctl_error_result(e)
+
+    def _ioctl_with_retry(self, cmd: DKSCSICmd) -> Optional[OSError]:
+        """Return None on success, or the final OSError after retries."""
+        for attempt in range(self._busy_retries + 1):
+            try:
+                fcntl.ioctl(self._fd, DKIOCSCSICMD, cmd)
+                return None
+            except OSError as e:
+                if _is_permission_error(e):
+                    return e
+                if _is_resource_busy_error(e) and attempt < self._busy_retries:
+                    delay_s = (self._busy_backoff_ms * (2 ** attempt)) / 1000.0
+                    logger.info(
+                        "ioctl(%s) busy, retrying in %.3fs (attempt %d/%d)",
+                        self._path,
+                        delay_s,
+                        attempt + 1,
+                        self._busy_retries,
+                    )
+                    time.sleep(delay_s)
+                    continue
+                return e
+        return None
+
+    def _ioctl_error_result(self, err: OSError) -> TransferResult:
+        if _is_permission_error(err):
+            code = ERR_PERMISSION_DENIED
+            kind = "permission denied"
+        elif _is_resource_busy_error(err):
+            code = ERR_RESOURCE_BUSY
+            kind = "resource busy"
+        else:
+            code = ERR_IOCTL_FAILED
+            kind = "ioctl failed"
+        return TransferResult(
+            ok=False,
+            error_code=code,
+            error_message=f"{kind} on {self._path}: {err}",
+        )
