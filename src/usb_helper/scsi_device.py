@@ -3,11 +3,17 @@ SCSI-over-Bulk USB device implementation.
 
 Wraps BulkDevice to provide SCSI command execution using
 the USB Mass Storage Bulk-Only Transport (CBW/CSW) protocol.
+
+On macOS, automatically uses BSD ioctl SCSI pass-through when
+the device appears as a mass-storage disk (``/dev/rdiskN``).
+This matches the Swift am12xx_mptool_macos behaviour and avoids
+conflicts with the macOS kernel's IOUSBMassStorageClass driver.
 """
 
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Optional
 
 from .bulk_device import BulkDevice
@@ -29,6 +35,8 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+_IS_DARWIN = sys.platform == "darwin"
 
 
 class SCSIDevice(USBDevice):
@@ -61,6 +69,8 @@ class SCSIDevice(USBDevice):
         self._frame_size = frame_size
         self._max_retries = max_retries
         self._tag: int = 0
+        # macOS Darwin SCSI ioctl transport (None when not on macOS or no BSD node)
+        self._darwin_transport: Optional[object] = None
 
     @property
     def frame_size(self) -> int:
@@ -71,9 +81,52 @@ class SCSIDevice(USBDevice):
         """Access the underlying BulkDevice for raw transfers if needed."""
         return self._bulk
 
+    @property
+    def using_darwin_ioctl(self) -> bool:
+        """Whether this device is using macOS BSD ioctl instead of libusb."""
+        return self._darwin_transport is not None
+
     def open(self) -> None:
         if self._is_open:
             return
+
+        # On macOS, try BSD ioctl SCSI pass-through first.
+        # This is required when the kernel's IOUSBMassStorageClass has
+        # claimed the USB interface (typical for UDISK-mode devices).
+        if _IS_DARWIN:
+            try:
+                from ._darwin_scsi import find_bsd_node, DarwinSCSITransport
+
+                logger.info(
+                    "Darwin: looking up BSD node for %s (VID=%04x PID=%04x serial=%r)",
+                    self._identity.device_id,
+                    self._identity.vid,
+                    self._identity.pid,
+                    self._identity.serial,
+                )
+                bsd_path = find_bsd_node(
+                    self._identity.vid,
+                    self._identity.pid,
+                    serial=self._identity.serial,
+                )
+                if bsd_path:
+                    transport = DarwinSCSITransport()
+                    transport.open(bsd_path)
+                    self._darwin_transport = transport
+                    self._is_open = True
+                    logger.info(
+                        "Using Darwin SCSI ioctl for %s via %s",
+                        self._identity.device_id,
+                        bsd_path,
+                    )
+                    return
+            except Exception as e:
+                logger.info(
+                    "Darwin SCSI ioctl not available (%s), falling back to libusb",
+                    e,
+                )
+
+        # Fallback: standard libusb CBW/CSW path
         self._bulk.open()
         self._is_open = True
         self._tag = 0
@@ -81,7 +134,13 @@ class SCSIDevice(USBDevice):
     def close(self) -> None:
         if not self._is_open:
             return
-        self._bulk.close()
+
+        if self._darwin_transport is not None:
+            self._darwin_transport.close()
+            self._darwin_transport = None
+        else:
+            self._bulk.close()
+
         self._is_open = False
 
     def bulk_write(self, data: bytes, timeout_ms: int = 5000) -> TransferResult:
@@ -100,7 +159,10 @@ class SCSIDevice(USBDevice):
         timeout_ms: int = 5000,
     ) -> TransferResult:
         """
-        Execute a SCSI command via CBW/CSW protocol.
+        Execute a SCSI command.
+
+        On macOS with a BSD device node, uses ioctl pass-through.
+        Otherwise uses CBW/CSW protocol over USB bulk transfers.
 
         Args:
             cdb: SCSI Command Descriptor Block (up to 16 bytes)
@@ -120,6 +182,15 @@ class SCSIDevice(USBDevice):
         """
         if data_out and data_in_length:
             raise ValueError("Cannot specify both data_out and data_in_length")
+
+        # macOS ioctl path — no CBW/CSW needed, kernel handles framing
+        if self._darwin_transport is not None:
+            return self._darwin_transport.send_command(
+                cdb=cdb,
+                data_out=data_out,
+                data_in_length=data_in_length,
+                timeout_ms=timeout_ms,
+            )
 
         direction_in = data_in_length > 0
         transfer_length = data_in_length if direction_in else len(data_out or b"")
