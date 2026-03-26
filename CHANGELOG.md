@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-03-26
+
+### Fixed
+
+- **macOS BSD node matching**: `find_bsd_node(..., serial=...)` now actually applies serial filtering across all Darwin lookup strategies (`diskutil`, `ioreg` line parser, `ioreg` plist parser), avoiding wrong `/dev/rdiskN` selection when multiple devices share the same VID/PID.
+- **Darwin SCSI reliability**: improved matching behavior for multi-device setups by normalizing and validating serial values before binding to BSD raw disk nodes.
+
+### Tests
+
+- Added Darwin serial-filter test coverage for:
+  - `ioreg` line-based lookup with two same-VID/PID devices.
+  - `diskutil` plist lookup with serial disambiguation.
+  - `ioreg` plist lookup with serial disambiguation.
+
 ## [1.0.0] - 2025-03-25
 
 First release.
