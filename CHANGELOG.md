@@ -2,11 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4] - 2026-03-27
+
+### Added
+
+- **USB port reset on open**: New `reset_on_open=True` parameter for `BulkDevice` / `SCSIDevice`. Sends a USB port reset before claiming the interface, clearing any stuck device state from previous sessions. After reset the device re-enumerates and is re-found automatically. Off by default.
+
+### Fixed
+
+- **CSW tag=0 quirk handling**: Some vendor devices always return CSW tag=0 regardless of the CBW tag sent. Tag mismatch for tag=0 is now logged at DEBUG (not WARNING) since it's a known device quirk, not a protocol error.
+- **Diagnostic logging cleaned up**: All per-CBW/CSW exchange logging moved from INFO to DEBUG to reduce noise during extended retry loops. Key lifecycle events (device open, ready, reset) remain at INFO.
+
+## [1.0.3] - 2026-03-27
+
+### Fixed
+
+- **CSW-instead-of-data detection**: When a vendor-class USB device (interface class 0xFF) skips the data phase and returns a CSW directly (starting with "USBS" signature), `send_command()` now correctly identifies this as a CSW rather than treating the first bytes as data. This addresses a timeout case where the code consumed the CSW during the data read, then waited for a separate CSW that never came.
+- **Full-buffer CSW scan**: Embedded CSW detection now uses `bytes.find()` to search the entire response buffer for the "USBS" signature, not just the bytes immediately after `data_in_length`. Handles cases where CSW is at a non-obvious offset within a USB packet.
+
+### Changed
+
+- **Darwin ioctl is now opt-in**: `SCSIDevice(..., darwin_ioctl=True)` must be explicitly set to enable BSD ioctl SCSI pass-through via `/dev/rdiskN`. Default is `False`. Devices without a BSD disk node will fall through to libusb. Existing callers that don't pass `darwin_ioctl` are unaffected (they already used libusb).
+- **Diagnostic logging**: `send_command()` now logs CBW details, data-phase hex dumps (first 64 bytes), and CSW resolution (embedded vs separate) at INFO level to aid USB protocol debugging.
+
+### Tests
+
+- Added `TestSCSIDeviceCSWInsteadOfData` with 3 test cases:
+  - CSW with PHASE_ERROR instead of data → triggers retry, second attempt succeeds
+  - CSW with FAILED status instead of data → returns error immediately
+  - CSW with PASSED status but no data → returns empty data
+- Added `test_open_skips_darwin_by_default` verifying darwin_ioctl=False is the default
+- Updated all Darwin integration tests to explicitly pass `darwin_ioctl=True`
+- Total: 136 tests passing
+
 ## [1.0.2] - 2026-03-26
 
 ### Added
 
-- **macOS auto-unmount option for firmware flashing**: `SCSIDevice(..., darwin_auto_unmount=True)` now performs a best-effort `diskutil unmountDisk` before opening `/dev/rdiskN`, reducing OS contention during flashing workflows.
+- **macOS auto-unmount option for raw SCSI workflows**: `SCSIDevice(..., darwin_auto_unmount=True)` now performs a best-effort `diskutil unmountDisk` before opening `/dev/rdiskN`, reducing OS contention during raw device operations.
 
 ### Improved
 

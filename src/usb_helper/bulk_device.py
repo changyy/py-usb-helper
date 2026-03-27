@@ -62,10 +62,12 @@ class BulkDevice(USBDevice):
         identity: DeviceIdentity,
         frame_size: int = 65536,
         interface_number: int = 0,
+        reset_on_open: bool = False,
     ):
         super().__init__(identity)
         self._frame_size = frame_size
         self._interface_number = interface_number
+        self._reset_on_open = reset_on_open
         self._usb_dev: Optional[usb.core.Device] = None
         self._ep_out: Optional[usb.core.Endpoint] = None
         self._ep_in: Optional[usb.core.Endpoint] = None
@@ -82,13 +84,17 @@ class BulkDevice(USBDevice):
 
         ident = self._identity
 
-        # Find device by bus + address (most precise)
-        dev = usb.core.find(
-            idVendor=ident.vid,
-            idProduct=ident.pid,
-            bus=ident.bus or None,
-            address=ident.address or None,
-        )
+        # Find device by bus + address (most precise).
+        # IMPORTANT: only include bus/address in kwargs when they have
+        # real values.  pyusb treats `bus=None` as a filter that requires
+        # `device.bus == None`, which never matches — so passing None
+        # causes find() to return nothing even though the device exists.
+        find_kwargs: dict = dict(idVendor=ident.vid, idProduct=ident.pid)
+        if ident.bus:
+            find_kwargs["bus"] = ident.bus
+        if ident.address:
+            find_kwargs["address"] = ident.address
+        dev = usb.core.find(**find_kwargs)
 
         if dev is None:
             raise USBDeviceNotFoundError(
@@ -105,6 +111,14 @@ class BulkDevice(USBDevice):
                 logger.debug("Detached kernel driver for interface %d", self._interface_number)
         except (usb.core.USBError, NotImplementedError):
             pass  # Not supported on all platforms
+
+        # USB port reset — clears any stuck device state from a previous
+        # session.  Especially important on macOS with vendor-class (0xFF)
+        # devices that don't get properly reset by the OS between sessions.
+        # After reset, the device re-enumerates so we must re-find it.
+        if self._reset_on_open:
+            dev = self._try_usb_reset(dev)
+            self._usb_dev = dev
 
         # Set default configuration
         try:
@@ -127,6 +141,24 @@ class BulkDevice(USBDevice):
             raise USBError(
                 f"Cannot claim interface {self._interface_number}: {e}"
             ) from e
+
+        # Reset endpoint data toggles by sending SET_INTERFACE.
+        # IOKit's USBInterfaceOpen() does this automatically, but
+        # libusb's claim_interface does NOT.  Without this, vendor-class
+        # devices (class 0xFF) may have out-of-sync data toggles from a
+        # previous session, causing the device to silently drop packets.
+        try:
+            dev.set_interface_altsetting(
+                interface=self._interface_number,
+                alternate_setting=0,
+            )
+            logger.debug(
+                "SET_INTERFACE(%d, alt=0) OK — endpoint toggles reset",
+                self._interface_number,
+            )
+        except usb.core.USBError as e:
+            # Not fatal: some devices don't support SET_INTERFACE
+            logger.debug("SET_INTERFACE failed (non-fatal): %s", e)
 
         # Discover endpoints
         cfg = dev.get_active_configuration()
@@ -155,6 +187,48 @@ class BulkDevice(USBDevice):
             self._ep_out.bEndpointAddress,
             self._ep_in.bEndpointAddress,
         )
+
+    def _try_usb_reset(self, dev: usb.core.Device) -> usb.core.Device:
+        """Send USB port reset and re-find the device.
+
+        After a port reset the device re-enumerates and may get a new
+        bus address, so we re-find it by VID/PID (and optionally bus).
+        Returns the (possibly new) device object.
+        """
+        import time
+
+        ident = self._identity
+        try:
+            dev.reset()
+            logger.info("USB device reset OK, waiting for re-enumeration…")
+            time.sleep(2)
+        except usb.core.USBError as e:
+            logger.debug("USB device reset failed (non-fatal): %s", e)
+            return dev
+
+        # Re-find device after reset (address may have changed)
+        new_dev = usb.core.find(
+            idVendor=ident.vid,
+            idProduct=ident.pid,
+        )
+        if new_dev is None:
+            logger.warning(
+                "Device not found after USB reset, using original handle"
+            )
+            return dev
+
+        # Detach kernel driver again after reset
+        try:
+            if new_dev.is_kernel_driver_active(self._interface_number):
+                new_dev.detach_kernel_driver(self._interface_number)
+        except (usb.core.USBError, NotImplementedError):
+            pass
+
+        logger.info(
+            "Re-found device after reset at bus=%s addr=%s",
+            new_dev.bus, new_dev.address,
+        )
+        return new_dev
 
     def close(self) -> None:
         """Release interface and free device."""
@@ -227,6 +301,11 @@ class BulkDevice(USBDevice):
         """
         Read data from bulk IN endpoint.
 
+        On macOS (IOKit backend), libusb raises EOVERFLOW when the device
+        sends a full ``wMaxPacketSize`` packet but the requested buffer is
+        smaller.  To prevent this we always allocate at least
+        ``wMaxPacketSize`` bytes and trim the result.
+
         Args:
             size: Maximum bytes to read
             timeout_ms: Timeout in milliseconds
@@ -238,7 +317,13 @@ class BulkDevice(USBDevice):
             return TransferResult(ok=False, error_code=1, error_message="Device not open")
 
         try:
-            raw = self._ep_in.read(size, timeout=timeout_ms)
+            # Allocate at least one max-packet to avoid EOVERFLOW on macOS
+            # when the device returns a full packet for a small request.
+            max_pkt = getattr(self._ep_in, "wMaxPacketSize", 512) or 512
+            read_size = max(size, max_pkt)
+            raw = self._ep_in.read(read_size, timeout=timeout_ms)
+            # Return ALL received bytes — callers (e.g. send_command) may
+            # need the extra data to detect an embedded CSW.
             data = bytes(raw)
             return TransferResult(ok=True, data=data, bytes_transferred=len(data))
 
@@ -250,6 +335,22 @@ class BulkDevice(USBDevice):
             return TransferResult(
                 ok=False, error_code=3, error_message=f"Read error: {e}"
             )
+
+    def clear_halt(self) -> None:
+        """Clear HALT / STALL on both bulk endpoints.
+
+        Call this after a USB protocol error (e.g. PHASE_ERROR) to
+        reset the endpoint toggle state before retrying.  Best-effort:
+        errors are logged but do not raise.
+        """
+        if self._usb_dev is None:
+            return
+        for ep in (self._ep_out, self._ep_in):
+            if ep is not None:
+                try:
+                    self._usb_dev.clear_halt(ep)
+                except usb.core.USBError as e:
+                    logger.debug("clear_halt(0x%02x): %s", ep.bEndpointAddress, e)
 
     def bulk_write_read(
         self,

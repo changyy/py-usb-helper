@@ -7,8 +7,7 @@ Userspace libusb can still enumerate the device, but cannot reliably
 send vendor-specific SCSI commands because the kernel driver intercepts
 them.
 
-The macOS solution (identical to the Swift am12xx_mptool_macos
-implementation) is to use BSD ioctl SCSI pass-through:
+The macOS solution is to use BSD ioctl SCSI pass-through:
 
     open("/dev/rdiskN")  →  ioctl(fd, DKIOCSCSICMD, &dk_scsi_cmd_t)
 
@@ -59,7 +58,7 @@ ERR_RESOURCE_BUSY = 17
 
 
 # ── dk_scsi_cmd_t ──────────────────────────────────────────────
-# Mirrors the Swift struct in am12xx_mptool_macos USBMassStorageDevice.swift.
+# Mirrors the Swift struct definition used by the macOS ioctl path.
 # Layout verified against Darwin IOStorageFamily headers.
 
 class DKSCSICmd(ctypes.Structure):
@@ -151,7 +150,7 @@ def find_bsd_node(
 
     _log_stderr(
         "find_bsd_node: NO BSD node found for VID=%04x PID=%04x — "
-        "will fall back to libusb (likely to fail on macOS)",
+        "will fall back to libusb",
         vid, pid,
     )
     return None

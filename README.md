@@ -39,8 +39,8 @@ Verify your setup:
 Found 3 device(s):
 
   usb:1-3  1234:abcd  "TestDev"  [Bulk mode]  (mode=bulk)
-  usb:1-5  05ac:8106
-  usb:2-1  1d6b:0002
+  usb:1-5  5678:1001
+  usb:2-1  9abc:def0
 ```
 
 ```

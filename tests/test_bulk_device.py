@@ -55,6 +55,7 @@ def mock_usb_env(identity):
 
     ep_in = MagicMock()
     ep_in.bEndpointAddress = 0x81
+    ep_in.wMaxPacketSize = 512
 
     # Interface and config
     intf = MagicMock()
